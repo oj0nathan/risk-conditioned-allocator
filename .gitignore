@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# VS Code settings
+.vscode/
+
+# Streamlit local config
+.streamlit/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Generated research outputs
+*.csv
+*.parquet
+*.pkl

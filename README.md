@@ -1,288 +1,186 @@
-````markdown
-# Risk-Conditioned Allocation Engine
+Risk-Conditioned Allocation Engine for Trend / Mean-Reversion Sleeves
+This project tests whether a simple **risk-conditioned allocator** can systematically improve the way capital is split between trend-following, mean-reversion, and cash. The engine trades a small multi-asset universe, builds trend and mean-reversion signals on each asset, and then uses market volatility, autocorrelation, and portfolio risk constraints (VaR and drawdown) to scale exposures dynamically.
 
-Systematic allocation engine that dynamically rotates capital between **trend-following**, **mean-reversion**, and **cash** based on **volatility**, **autocorrelation**, and **risk constraints**.
-
-The project is implemented as a backtestable research library in Python and is intended as a transparent, fully-commented example of how a professional systematic allocator might be structured.
+The code is written in Python using pandas, NumPy, SciPy, yfinance, and is structured as a reusable backtest function (`run_backtest`) that returns equity curves and performance statistics.
 
 ---
 
-## 1. High-Level Idea
+TL;DR
 
-The engine combines two sleeves:
+* Construct long-only **trend** signals from price vs SMA (e.g. 100-day moving average) and **mean-reversion** signals from Bollinger bands (price vs rolling mean ± k·σ).
+* Apply signals cross-sectionally across a small multi-asset universe (SPY, TLT, GLD, USO, UUP), then equal-weight across assets to form:
 
-- **Trend sleeve** – long-only, price–SMA momentum.
-- **Mean-reversion sleeve** – Bollinger-band style, long/short.
+  * a **Trend sleeve** and
+  * a **Mean-Reversion sleeve**.
+* Estimate **EWMA volatility** for the market basket, trend sleeve, and MR sleeve, plus **rolling autocorrelation** of the market basket.
+* Define a **signal-to-noise map** from (market volatility, autocorrelation) to sleeve weights:
 
-At each date it:
+  * High vol & positive autocorr → allocate to **trend**
+  * High vol & negative autocorr → allocate to **mean reversion**
+  * High vol & near-zero autocorr → treat as **noise**, sit in cash
+  * Low vol → **50/50** trend + MR mix.
+* Vol-target each sleeve to a **per-sleeve target vol** (e.g. 10% annualised) and then apply:
 
-1. Measures **market volatility** (EWMA) and **autocorrelation** of an equal-weight “market” basket.
-2. Classifies the environment into:
-   - **Trending high-vol** → allocate to trend.
-   - **Mean-reverting high-vol** → allocate to MR.
-   - **Noisy high-vol** → de-risk to cash.
-   - **Low-vol** → diversify 50/50 across trend + MR.
-3. Sizes each sleeve using:
-   - **Volatility targeting** (per-sleeve target vol).
-   - **Portfolio-level EWMA VaR cap**.
-   - **Drawdown breaker** based on recent equity curve.
-4. Blends the risky sleeve(s) with **cash at a risk-free rate**, then updates portfolio equity.
+  * a **portfolio EWMA VaR cap** (one-day 95% VaR ≤ 2% of equity), and
+  * a **drawdown breaker** (risk cuts when recent drawdown exceeds 3% over 5 days).
+* Combine risk-scaled sleeves with cash at a configurable **risk-free rate** and backtest the resulting portfolio vs:
 
-Outputs include equity curves and performance stats versus:
+  * Buy & hold SPY
+  * Fixed 50/50 Trend + MR.
+* Output equity curves and performance stats (CAGR, vol, Sharpe, Sortino, max drawdown, worst 5-day loss) for all three strategies.
 
-- Buy & Hold **SPY**
-- Fixed **50/50 Trend + MR**
-- **Risk-Managed Allocator**
-
----
-
-## 2. Asset Universe & Data
-
-By default the engine trades a small multi-asset universe:
-
-```python
-DEFAULT_ASSET_TICKERS = {
-    "SPY": "Equities - S&P 500",
-    "TLT": "Rates - US 20Y+ Treasuries",
-    "GLD": "Commodities - Gold",
-    "USO": "Commodities - Crude Oil (proxy)",
-    "UUP": "FX - US Dollar Index (proxy for DXY)",
-}
-````
-
-* Prices are pulled via [`yfinance`](https://github.com/ranaroussi/yfinance).
-* Backtest frequency: **daily**.
-* Returns are computed as **log returns** on adjusted close.
-
-You can replace `DEFAULT_ASSET_TICKERS` with any set of liquid tickers supported by Yahoo Finance.
+This is a research/learning project – not investment advice.
 
 ---
 
-## 3. Model Components
+What this project demonstrates
 
-### 3.1 Signal Layer
+* A clean implementation of a **multi-sleeve allocation engine** that routes capital between trend, mean-reversion, and cash using simple, interpretable rules.
+* Use of **EWMA volatility** and **autocorrelation** as a compact “market state” proxy, separating:
 
-**Trend-Following**
+  * *what* the signals want to do (trend vs MR) from
+  * *how much* risk the portfolio should run.
+* Practical **risk management overlays**:
 
-* Signal: `+1` when price > SMA, `0` otherwise (long-only).
-* SMA window (default `100` days) controlled by:
+  * per-sleeve volatility targeting,
+  * portfolio-level EWMA VaR cap,
+  * drawdown-based risk throttling.
+* Careful handling of **look-ahead bias**:
 
-```python
-trend_sma_window = config.get("trend_sma_window", 100)
-```
-
-**Mean-Reversion**
-
-* Signal: `+1` when price < lower Bollinger band.
-* Signal: `-1` when price > upper Bollinger band.
-* Flat inside the band.
-* Controlled by:
-
-```python
-mr_window  = config.get("mr_window", 30)
-mr_num_std = config.get("mr_num_std", 2.5)
-```
-
-Signals are **lagged by 1 day** before being applied to returns to avoid look-ahead bias.
-
-### 3.2 Volatility & Risk State
-
-* **EWMA volatility** with decay `λ` (default `0.94`) for:
-
-  * Market basket
-  * Trend sleeve
-  * MR sleeve
-* **Autocorrelation** of the market basket at lag 1 over a rolling window (default `20` days).
-* “High vol” is defined as the upper quantile of market vol:
-
-```python
-high_vol_quantile = config.get("high_vol_quantile", 0.75)
-high_vol_thresh   = ewma_vol_market.quantile(high_vol_quantile)
-```
-
-### 3.3 Signal-to-Noise Allocator
-
-The function:
-
-```python
-signal_to_noise_allocation(vol, rho, high_vol_threshold, rho_thresh=0.10)
-```
-
-maps `(market_vol, market_autocorr)` → `(weight_trend, weight_mr)`:
-
-* `vol > high_vol_thresh` and `rho > +ρ*` → **1.0 trend, 0.0 MR**
-* `vol > high_vol_thresh` and `rho < −ρ*` → **0.0 trend, 1.0 MR**
-* `vol > high_vol_thresh` and `|rho| ≤ ρ*` → **0.0 trend, 0.0 MR (cash)**
-* `vol ≤ high_vol_thresh` → **0.5 trend, 0.5 MR** (diversified low-vol regime)
-
-where `ρ* = rho_threshold` (default `0.10`).
-
-### 3.4 Risk Overlays
-
-1. **Per-sleeve vol targeting**
-
-   For each sleeve:
-
-   ```python
-   scale_trend = alloc_trend * (target_vol_sleeve / vol_trend)
-   scale_mr    = alloc_mr    * (target_vol_sleeve / vol_mr)
-   ```
-
-   with `target_vol_sleeve` default `10%` annualised.
-
-2. **Portfolio EWMA VaR cap**
-
-   * Track EWMA variance of portfolio returns (`lam_port`, default `0.94`).
-
-   * Compute one-day VaR at 95%:
-
-     ```python
-     z_95     = norm.ppf(0.95)
-     var_prev = z_95 * daily_vol_prev
-     ```
-
-   * If `VaR > var_limit` (default `2%` of equity), scale risk down:
-
-     ```python
-     var_scale = min(1.0, var_limit / var_prev)
-     ```
-
-3. **Drawdown breaker**
-
-   * Track equity over last `dd_window` days (default `5`).
-   * If running drawdown exceeds `dd_threshold` (default `-3%`), halve the risk:
-
-     ```python
-     if dd_prev < -dd_threshold:
-         dd_scale = 0.5
-     ```
-
-4. **Total scaling and cash weight**
-
-   ```python
-   total_scale = min(var_scale, dd_scale)
-
-   if alloc_trend == 0 and alloc_mr == 0:
-       r_risky = 0.0
-       cash_weight = 1.0
-   else:
-       r_risky = total_scale * r_pre     # sleeves
-       cash_weight = 1.0 - total_scale  # remaining in cash
-   ```
-
-   Cash accrues at a configurable risk-free rate (default `3%` annual).
+  * signals are lagged by one day before being applied to returns,
+  * EWMA risk metrics and VaR use information available only up to the previous day.
+* A benchmarked comparison vs naive alternatives (SPY buy-and-hold and fixed 50/50 Trend+MR), with a consistent performance-statistics framework.
 
 ---
 
-## 4. Backtest API
+Data & Universe
 
-The main entrypoint is:
+Asset universe (downloaded from Yahoo Finance via `yfinance`):
 
-```python
-results = run_backtest(
-    asset_tickers=None,      # dict of tickers -> description (defaults to DEFAULT_ASSET_TICKERS)
-    start_date="2005-01-01",
-    end_date=None,           # default: today
-    config=None,             # dict overriding DEFAULT_CONFIG
-)
-```
+* **SPY** – Equities: S&P 500
+* **TLT** – Rates: US 20Y+ Treasuries
+* **GLD** – Commodities: Gold
+* **USO** – Commodities: Crude Oil proxy
+* **UUP** – FX: US Dollar Index proxy
 
-### 4.1 Configuration
+Implementation details:
 
-Key parameters (with defaults):
-
-```python
-DEFAULT_CONFIG = {
-    "target_vol_sleeve": 0.10,
-    "rho_threshold":     0.10,
-    "var_limit":         0.02,
-    "dd_threshold":      0.03,
-    "lam_port":          0.94,
-    "risk_free_annual":  0.03,
-    "high_vol_quantile": 0.75,
-
-    # signal parameters
-    "trend_sma_window": 100,
-    "mr_window":        30,
-    "mr_num_std":       2.5,
-}
-```
-
-You can pass a partial dict to override any subset, e.g.:
-
-```python
-my_config = {
-    "target_vol_sleeve": 0.12,
-    "trend_sma_window":  75,
-    "mr_window":         20,
-}
-results = run_backtest(config=my_config)
-```
-
-### 4.2 Outputs
-
-`run_backtest` returns a dictionary:
-
-```python
-{
-    "equity_spy":          pd.Series,
-    "equity_50_50":        pd.Series,
-    "equity_rm":           pd.Series,   # risk-managed allocator
-    "stats_df":            pd.DataFrame,
-
-    # additional diagnostics
-    "alloc_trend":         pd.Series,
-    "alloc_mr":            pd.Series,
-    "equity_rm_series":    pd.Series,
-    "var_used":            pd.Series,
-    "var_scale":           pd.Series,
-    "dd_scale":            pd.Series,
-    "total_scale":         pd.Series,
-    "vol_market":          pd.Series,
-    "rho_market":          pd.Series,
-}
-```
-
-`stats_df` contains standard performance metrics (annualised, daily frequency):
-
-* CAGR
-* Annualised volatility
-* Sharpe ratio
-* Sortino ratio
-* Maximum drawdown
-* Worst 5-day return
-
-Example usage:
-
-```python
-from risk_allocator import run_backtest   # adjust module name to your file
-
-results      = run_backtest(start_date="2010-01-01")
-stats        = results["stats_df"]
-equity_rm    = results["equity_rm"]
-equity_spy   = results["equity_spy"]
-
-print(stats)
-equity_rm.plot(title="Risk-Managed Allocator vs SPY")
-```
+* Uses **adjusted close** prices from Yahoo Finance.
+* Computes **daily log returns**.
+* Trend and mean-reversion signals are built on prices; portfolio construction and risk management operate on daily returns.
+* You can override the default universe by passing a custom `asset_tickers` dict into `run_backtest`.
 
 ---
 
-## 5. Repository Layout 
+Model Overview
 
-```text
-risk-conditioned-allocator/
-├── risk_allocator.py       # contains run_backtest and helper functions
-├── notebooks/
-│   └── exploration.ipynb   # optional research / sanity checks
-├── requirements.txt
-└── README.md
-```
+**Signal Layer**
 
-If you are using a Streamlit dashboard, you might also have:
+* Trend signal per asset:
 
-```text
-├── app.py                  # Streamlit UI that calls run_backtest
-└── .streamlit/
-    └── config.toml
-```
+  * SMA-based rule: `+1` when price > SMA, `0` otherwise (long-only by default).
+  * SMA horizon configurable via `trend_sma_window`.
+* Mean-reversion signal per asset:
+
+  * Bollinger-band rule:
+
+    * `+1` when price < lower band (oversold),
+    * `-1` when price > upper band (overbought),
+    * `0` inside the band.
+  * Controlled by `mr_window` (lookback) and `mr_num_std` (band width).
+* Signals are **lagged by 1 day** before they are multiplied with returns → avoids trading on information from the same day’s close.
+* Sleeve returns:
+
+  * Trend sleeve = equal-weight of all asset-level trend-signal returns.
+  * MR sleeve = equal-weight of all asset-level MR-signal returns.
+  * Market basket = equal-weight of raw asset returns.
+
+**Market State & Signal-to-Noise Allocator**
+
+* Compute **EWMA volatility** for the market basket (and sleeves) with decay λ (e.g. 0.94).
+
+* Compute **rolling autocorrelation** of market returns (lag 1, e.g. 20-day window).
+
+* Define a “high volatility” threshold as a quantile (e.g. 75th percentile) of EWMA vol.
+
+* Map `(vol_market, rho_market)` → `(weight_trend, weight_mr)`:
+
+  * If `vol > high_vol_thresh`:
+
+    * `rho > +ρ*` → (1.0, 0.0)  → **pure trend**
+    * `rho < −ρ*` → (0.0, 1.0)  → **pure mean reversion**
+    * `|rho| ≤ ρ*` → (0.0, 0.0) → **noise → cash**
+  * If `vol ≤ high_vol_thresh`:
+
+    * `(0.5, 0.5)` → **balanced mix**.
+
+* Thresholds `ρ*` and the vol quantile are configurable via the `config` dict.
+
+**Risk Overlays**
+
+1. **Per-sleeve Volatility Targeting**
+
+   * Compute EWMA vol for trend and MR sleeves.
+   * Scale sleeves to hit a per-sleeve target vol, e.g.:
+
+     `scale_trend = alloc_trend * target_vol_sleeve / vol_trend`
+     `scale_mr    = alloc_mr    * target_vol_sleeve / vol_mr`
+
+2. **Portfolio EWMA VaR Cap**
+
+   * Maintain EWMA variance of daily portfolio returns using parameter `lam_port`.
+   * Compute one-day 95% VaR: `VaR = z_95 * daily_vol_prev`.
+   * If `VaR > var_limit` (e.g. 2% of equity), multiply risky exposure by `var_limit / VaR`.
+
+3. **Drawdown Breaker**
+
+   * Maintain a rolling window of recent equity values (e.g. 5 days).
+   * Compute running peak and current drawdown.
+   * If drawdown < −`dd_threshold` (e.g. −3%), cut risk (e.g. halve exposures).
+
+4. **Cash & Risk-Free Return**
+
+   * If both sleeves are turned off (trend=0, MR=0), portfolio sits fully in cash.
+   * Otherwise, risky sleeves are scaled by the minimum of VaR- and DD-scales; residual capital sits in cash and earns a configurable risk-free rate (default 3% annualised).
+
+**Backtest & Benchmarks**
+
+* The main function `run_backtest` orchestrates:
+
+  1. Downloading prices and computing daily log returns.
+  2. Building trend and MR signals and sleeves.
+  3. Estimating EWMA vol, autocorrelation, and portfolio variance.
+  4. Running the day-by-day allocation loop with risk overlays.
+  5. Computing equity curves and performance statistics.
+
+* Benchmarks:
+
+  * **Buy & Hold SPY**.
+  * **Fixed 50/50 Trend + MR** (equal risk exposure to both sleeves, no dynamic risk overlays).
+  * **Risk-Managed Allocator** (full engine).
+
+* Performance metrics (daily → annualised) include:
+
+  * CAGR
+  * Annualised volatility
+  * Sharpe ratio
+  * Sortino ratio
+  * Maximum drawdown
+  * Worst 5-day return
+
+---
+
+Data & Implementation Details
+
+* Prices from Yahoo Finance via `yfinance.download`.
+* Pandas Series/DataFrames used for all time series.
+* NumPy used for vectorised operations and rolling calculations.
+* SciPy (`scipy.stats.norm`) used for normal quantiles in VaR.
+
+The whole backtest is encapsulated in `run_backtest(...)`, which returns a dictionary of equity curves, risk diagnostics, and performance statistics that can be easily plugged into notebooks or a Streamlit dashboard.
+
+---
+
+Disclaimer
+
+This repository is for **educational and research purposes only**. It is not investment advice, an offer, or a recommendation to buy or sell any security or to implement this strategy in live trading. The backtests ignore many real-world frictions (transaction costs, liquidity constraints, taxes, slippage, borrow availability). Use at your own risk.

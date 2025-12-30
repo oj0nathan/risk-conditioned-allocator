@@ -1,4 +1,4 @@
-Risk-Conditioned Allocation Engine for Trend / Mean-Reversion Sleeves
+# Risk-Conditioned Allocation Engine for Trend / Mean-Reversion Sleeves
 This project tests whether a simple **risk-conditioned allocator** can systematically improve the way capital is split between trend-following, mean-reversion, and cash. The engine trades a small multi-asset universe, builds trend and mean-reversion signals on each asset, and then uses market volatility, autocorrelation, and portfolio risk constraints (VaR and drawdown) to scale exposures dynamically.
 
 The code is written in Python using pandas, NumPy, SciPy, yfinance, and is structured as a reusable backtest function (`run_backtest`) that returns equity curves and performance statistics.
